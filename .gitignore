@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+
+# Logs
+*.log
+app.log
+
+# OS/editor
+.DS_Store
+*.swp
+
+# Reports
+*.pdf
+
+# Local dotenv (if present)
+.env
