@@ -18,6 +18,7 @@ from reportlab.pdfgen import canvas
 from reportlab.graphics.barcode import code128  # For realistic barcode
 from io import BytesIO
 import smtplib
+import re
 from email.message import EmailMessage
 import threading
 
@@ -37,7 +38,7 @@ cors.init_app(
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
             "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
             "supports_credentials": True,
-            "expose_headers": ["Content-Disposition"]
+            "expose_headers": ["Content-Disposition", "X-Cancel-Nonce", "X-No-Registrations"]
         }
     },
     supports_credentials=True
@@ -570,6 +571,29 @@ def profile():
 def add_flight():
     user_email = get_jwt_identity()
     data = request.json
+
+    # Basic input presence validation
+    required = ['flight_name', 'business_total', 'economy_total', 'source', 'destination', 'start_time', 'end_time', 'economy_cost', 'business_cost']
+    if not all(k in data for k in required):
+        return jsonify({'msg': 'Missing required fields'}), 400
+
+    # Parse and validate datetimes (format: dd/MM/YYYY HH:mm)
+    try:
+        start_dt = datetime.strptime(data['start_time'], '%d/%m/%Y %H:%M')
+        end_dt = datetime.strptime(data['end_time'], '%d/%m/%Y %H:%M')
+    except Exception:
+        return jsonify({'msg': 'Invalid date format. Use dd/MM/YYYY HH:mm'}), 400
+
+    now = datetime.now()
+    if start_dt <= now:
+        return jsonify({'msg': 'Departure time must be in the future'}), 400
+    if end_dt <= start_dt:
+        return jsonify({'msg': 'Arrival time must be after departure time'}), 400
+    if not str(data['source']).strip() or not str(data['destination']).strip():
+        return jsonify({'msg': 'Source and destination are required'}), 400
+    if str(data['source']).strip().lower() == str(data['destination']).strip().lower():
+        return jsonify({'msg': 'Destination cannot be the same as source'}), 400
+
     flight_id = db.flights.insert_one({
         'Flight Name': data['flight_name'],
         'Business Total Seats': int(data['business_total']),
@@ -588,6 +612,50 @@ def add_flight():
         'Employee': user_email
     })
     return jsonify({'msg': 'Flight added'}), 201
+
+# Flight Suggestions (New)
+@app.route('/flights/suggestions', methods=['GET'])
+def flight_suggestions():
+    """
+    Public endpoint to fetch unique flight fields for auto-complete.
+    Query params:
+      - field: 'source' | 'destination' (default: 'source')
+      - q: optional text to prefix-match (case-insensitive)
+      - limit: optional max results (default: 15, capped at 50)
+    Response: ["Mumbai", "New Delhi", ...]
+    """
+    try:
+        field = (request.args.get('field') or 'source').strip().lower()
+        q = (request.args.get('q') or '').strip()
+        try:
+            limit = min(max(int(request.args.get('limit', 15)), 1), 50)
+        except Exception:
+            limit = 15
+
+        field_map = {
+            'source': 'Source',
+            'destination': 'Destination',
+        }
+        mongo_field = field_map.get(field)
+        if not mongo_field:
+            return jsonify({'msg': 'Invalid field. Use source or destination'}), 400
+
+        pipeline = []
+        if q:
+            safe = re.escape(q)
+            pipeline.append({'$match': {mongo_field: {'$regex': f'^{safe}', '$options': 'i'}}})
+        pipeline.extend([
+            {'$group': {'_id': f'${mongo_field}'}},
+            {'$sort': {'_id': 1}},
+            {'$limit': limit}
+        ])
+
+        results = list(db.flights.aggregate(pipeline))
+        suggestions = [r['_id'] for r in results if r.get('_id')]
+        return jsonify(suggestions), 200
+    except Exception as e:
+        app.logger.error(f"Suggestions error: {e}")
+        return jsonify({'msg': 'Failed to load suggestions'}), 500
 
 # Search Flights (Unchanged)
 @app.route('/flights/search', methods=['POST'])
@@ -802,7 +870,7 @@ def view_customers():
         })
     return jsonify(result), 200
 
-# Check Weather (Unchanged)
+# Check Weather (Enhanced: optional selected flight IDs)
 @app.route('/weather/check', methods=['GET'])
 @jwt_required()
 @role_required('employee')
@@ -810,6 +878,14 @@ def check_weather():
     user_email = get_jwt_identity()
     current_time = datetime.now()
     one_hour_later = current_time + timedelta(hours=1)
+    # Optional filter by selected flight IDs: ?ids=comma,separated,ids
+    ids_param = (request.args.get('ids') or '').strip()
+    id_set = None
+    if ids_param:
+        try:
+            id_set = {ObjectId(x.strip()) for x in ids_param.split(',') if x.strip()}
+        except Exception:
+            return jsonify({'msg': 'Invalid flight id(s)'}), 400
     schedules_list = list(db.schedules.find())
     cancellations = []
 
@@ -844,6 +920,8 @@ def check_weather():
     for schedule in schedules_list:
         flight = db.flights.find_one({'_id': schedule['Flight ID']})
         if not flight:
+            continue
+        if id_set is not None and flight['_id'] not in id_set:
             continue
         try:
             flight_time = datetime.strptime(schedule['Start Time'], '%d/%m/%Y %H:%M')
@@ -899,6 +977,173 @@ def check_weather():
         except Exception as e:
             app.logger.error(f"Error processing flight: {e}")
     return jsonify({'msg': 'Weather check complete', 'cancellations': cancellations}), 200
+
+# Force Bad Weather flag for selected or all flights (no auto-cancel; for demo/testing)
+@app.route('/weather/force_bad', methods=['POST'])
+@jwt_required()
+@role_required('employee')
+def force_bad_weather():
+    data = request.get_json() or {}
+    ids = data.get('flight_ids') or []
+    mode = (data.get('mode') or '').strip().lower()  # 'all' or 'selected'
+    affected = []
+    # We'll just return affected flight names for UI to allow cancel; no DB flag required
+    try:
+        if mode == 'all':
+            schedules_list = list(db.schedules.find())
+            for schedule in schedules_list:
+                flight = db.flights.find_one({'_id': schedule['Flight ID']})
+                if flight:
+                    affected.append({'flight_id': str(flight['_id']), 'flight_name': flight.get('Flight Name', 'Unknown')})
+        else:
+            id_objs = []
+            for fid in ids:
+                try:
+                    id_objs.append(ObjectId(str(fid)))
+                except Exception:
+                    return jsonify({'msg': f'Invalid flight id: {fid}'}), 400
+            for oid in id_objs:
+                flight = db.flights.find_one({'_id': oid})
+                if flight:
+                    affected.append({'flight_id': str(flight['_id']), 'flight_name': flight.get('Flight Name', 'Unknown')})
+        return jsonify({'msg': 'Forced bad weather set for demo', 'affected': affected}), 200
+    except Exception as e:
+        app.logger.error(f'force_bad_weather error: {e}')
+        return jsonify({'msg': 'Failed to set bad weather'}), 500
+
+# List upcoming active flights (employee)
+@app.route('/flights/active', methods=['GET'])
+@jwt_required()
+@role_required('employee')
+def list_active_flights():
+    now = datetime.now()
+    results = []
+    for schedule in db.schedules.find():
+        try:
+            start_dt = datetime.strptime(schedule.get('Start Time', ''), '%d/%m/%Y %H:%M')
+        except Exception:
+            continue
+        if start_dt <= now:
+            continue
+        flight = db.flights.find_one({'_id': schedule['Flight ID']})
+        if not flight:
+            continue
+        results.append({
+            'flight_id': str(flight['_id']),
+            'flight_name': flight.get('Flight Name', 'Unknown'),
+            'source': flight.get('Source', ''),
+            'destination': flight.get('Destination', ''),
+            'start_time': schedule.get('Start Time', ''),
+            'end_time': schedule.get('End Time', ''),
+            'business_available': schedule.get('Business Available Seats', 0),
+            'economy_available': schedule.get('Economy Available Seats', 0),
+        })
+    return jsonify(results), 200
+
+# Export registered users for a flight as CSV and create a one-time cancel nonce
+@app.route('/flights/<flight_id>/registrations/export', methods=['GET'])
+@jwt_required()
+@role_required('employee')
+def export_flight_registrations(flight_id):
+    try:
+        oid = ObjectId(flight_id)
+    except Exception:
+        return jsonify({'msg': 'Invalid flight id'}), 400
+    flight = db.flights.find_one({'_id': oid})
+    if not flight:
+        return jsonify({'msg': 'Flight not found'}), 404
+    bookings = list(db.bookings.find({'Flight ID': oid}))
+    # Build CSV content (prepend a commented nonce line for fallback parsing on the client)
+    lines = [f'# CANCEL_NONCE,{""}', 'Booking ID,Customer Name,Customer Email,Customer Phone,Class,Seats,Passengers']
+    for b in bookings:
+        customer = db.users.find_one({'_id': b['Customer ID']})
+        cname = (customer or {}).get('Name', '')
+        cemail = (customer or {}).get('Email', '')
+        cphone = (customer or {}).get('Phone Number', '')
+        seats = ';'.join(b.get('Seats Booked', []))
+        pax = ';'.join([f"{p.get('Name','')}|{p.get('Age','')}|{p.get('Gender','')}" for p in b.get('Passengers', [])])
+        lines.append(f"{str(b.get('_id'))},{cname},{cemail},{cphone},{b.get('Class','')},{seats},{pax}")
+    # Fill the nonce in the first line now that it's generated
+    # Create a nonce and store
+    nonce = ''.join(random.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(32))
+    lines[0] = f'# CANCEL_NONCE,{nonce}'
+    csv_content = '\n'.join(lines)
+    db.cancel_nonces.insert_one({
+        'flight_id': oid,
+        'nonce': nonce,
+        'created_at': datetime.now(),
+        'used': False
+    })
+
+    from flask import make_response
+    resp = make_response(csv_content)
+    resp.headers['Content-Type'] = 'text/csv'
+    fname = f"registrations_{flight.get('Flight Name','flight').replace(' ', '_')}.csv"
+    resp.headers['Content-Disposition'] = f'attachment; filename="{fname}"'
+    # Send nonce via header so frontend can gate cancel
+    resp.headers['X-Cancel-Nonce'] = nonce
+    # Indicate if there were no registrations
+    resp.headers['X-No-Registrations'] = 'true' if len(bookings) == 0 else 'false'
+    return resp
+
+# Cancel a flight: requires nonce from export endpoint; removes schedule and bookings
+@app.route('/flights/<flight_id>/cancel', methods=['POST'])
+@jwt_required()
+@role_required('employee')
+def cancel_flight(flight_id):
+    data = request.get_json() or {}
+    force = bool(data.get('force'))
+    provided = data.get('cancel_nonce')
+    if not provided and not force:
+        return jsonify({'msg': 'cancel_nonce is required (download registrations first). To force-cancel, pass force=true.'}), 400
+    try:
+        oid = ObjectId(flight_id)
+    except Exception:
+        return jsonify({'msg': 'Invalid flight id'}), 400
+    rec = None
+    if not force:
+        rec = db.cancel_nonces.find_one({'flight_id': oid, 'nonce': provided, 'used': False})
+        if not rec:
+            return jsonify({'msg': 'Invalid or used cancel nonce. Please download registrations again.'}), 400
+
+    # Proceed with cancellation: delete bookings and schedule; keep flight doc to retain catalog if needed
+    try:
+        # Optional: notify customers (best effort)
+        affected_bookings = list(db.bookings.find({'Flight ID': oid}))
+        for b in affected_bookings:
+            try:
+                customer = db.users.find_one({'_id': b['Customer ID']})
+                flight = db.flights.find_one({'_id': oid})
+                sched = db.schedules.find_one({'Flight ID': oid}) or {}
+                travel_date = (sched.get('Start Time') or '').split(' ')[0]
+                send_cancellation_email(
+                    to_email=(customer or {}).get('Email',''),
+                    user_name=(customer or {}).get('Name',''),
+                    flight_name=(flight or {}).get('Flight Name','Unknown'),
+                    seat_numbers=b.get('Seats Booked', []),
+                    source=(flight or {}).get('Source','Unknown'),
+                    destination=(flight or {}).get('Destination','Unknown'),
+                    start=sched.get('Start Time',''),
+                    end=sched.get('End Time',''),
+                    travel_class=b.get('Class','Economy'),
+                    airline_name='HCL Airlines',
+                    travel_date=travel_date,
+                    passenger_details=b.get('Passengers', [])
+                )
+            except Exception as e:
+                app.logger.error(f'Failed to notify on cancel: {e}')
+        bookings_res = db.bookings.delete_many({'Flight ID': oid})
+        sched_res = db.schedules.delete_many({'Flight ID': oid})
+        try:
+            app.logger.info(f"cancel_flight: deleted {bookings_res.deleted_count} bookings and {sched_res.deleted_count} schedules for flight {str(oid)}")
+        except Exception:
+            pass
+        if rec:
+            db.cancel_nonces.update_one({'_id': rec['_id']}, {'$set': {'used': True, 'used_at': datetime.now()}})
+        return jsonify({'msg': 'Flight cancelled successfully'}), 200
+    except Exception as e:
+        app.logger.error(f'cancel_flight error: {e}')
+        return jsonify({'msg': 'Failed to cancel flight'}), 500
 
 # Statistics (Unchanged)
 @app.route('/stats', methods=['GET'])
