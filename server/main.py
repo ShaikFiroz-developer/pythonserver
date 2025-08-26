@@ -1144,8 +1144,7 @@ def cancel_flight(flight_id):
     except Exception as e:
         app.logger.error(f'cancel_flight error: {e}')
         return jsonify({'msg': 'Failed to cancel flight'}), 500
-
-# Statistics (Unchanged)
+# Statistics (Fixed with safe division and null handling)
 @app.route('/stats', methods=['GET'])
 @jwt_required()
 @role_required('employee')
@@ -1153,24 +1152,25 @@ def statistics():
     try:
         user_email = get_jwt_identity()
         total_bookings = db.bookings.count_documents({})
-        
+
         # Get total revenue
         revenue_result = list(db.bookings.aggregate([
             {'$match': {'Status': {'$ne': 'Flight Cancelled'}}},
             {'$group': {'_id': None, 'total': {'$sum': '$Total Cost'}}}
         ]))
         revenue = revenue_result[0]['total'] if revenue_result else 0
-        
+
         # Get cancellation count
         cancellations = db.bookings.count_documents({'Status': 'Flight Cancelled'})
-        
+
         # Calculate average passengers per booking
         avg_passengers_result = list(db.bookings.aggregate([
             {'$match': {'Status': {'$ne': 'Flight Cancelled'}}},
             {'$project': {'passenger_count': {'$size': '$Passengers'}}},
             {'$group': {'_id': None, 'avg': {'$avg': '$passenger_count'}}}
         ]))
-        avg_passengers = round(avg_passengers_result[0]['avg'], 2) if avg_passengers_result and avg_passengers_result[0]['avg'] is not None else 0
+        avg_passengers = round(avg_passengers_result[0]['avg'], 2) if avg_passengers_result and avg_passengers_result[0].get('avg') is not None else 0
+
         # Get gender distribution
         gender_dist = list(db.bookings.aggregate([
             {'$match': {'Status': {'$ne': 'Flight Cancelled'}}},
@@ -1178,19 +1178,19 @@ def statistics():
             {'$group': {'_id': '$Passengers.Gender', 'count': {'$sum': 1}}},
             {'$project': {'_id': 0, 'gender': '$_id', 'count': 1}}
         ]))
-        
+
         # Get top flights by passenger count
         top_flights = list(db.bookings.aggregate([
             {'$match': {'Status': {'$ne': 'Flight Cancelled'}}},
             {'$group': {
-                '_id': '$Flight ID', 
-                'passengers': {'$sum': {'$size': '$Passengers'}}, 
+                '_id': '$Flight ID',
+                'passengers': {'$sum': {'$size': '$Passengers'}},
                 'revenue': {'$sum': '$Total Cost'}
             }},
             {'$lookup': {
-                'from': 'flights', 
-                'localField': '_id', 
-                'foreignField': '_id', 
+                'from': 'flights',
+                'localField': '_id',
+                'foreignField': '_id',
                 'as': 'flight'
             }},
             {'$unwind': '$flight'},
@@ -1202,56 +1202,69 @@ def statistics():
             {'$sort': {'passengers': -1}},
             {'$limit': 5}
         ]))
-        
+
         # Get age group distribution
         age_groups = list(db.bookings.aggregate([
             {'$match': {'Status': {'$ne': 'Flight Cancelled'}}},
             {'$unwind': '$Passengers'},
             {'$bucket': {
-                'groupBy': '$Passengers.Age', 
-                'boundaries': [0, 18, 35, 60, 100], 
+                'groupBy': '$Passengers.Age',
+                'boundaries': [0, 18, 35, 60, 100],
                 'default': '100+',
                 'output': {'count': {'$sum': 1}}
             }}
         ]))
-        
-        # Get flight utilization
+
+        # Get flight utilization with safe division
         utilization = list(db.schedules.aggregate([
             {'$lookup': {
-                'from': 'flights', 
-                'localField': 'Flight ID', 
-                'foreignField': '_id', 
+                'from': 'flights',
+                'localField': 'Flight ID',
+                'foreignField': '_id',
                 'as': 'flight'
             }},
             {'$unwind': '$flight'},
             {'$project': {
                 'flight_name': '$flight.Flight Name',
                 'business_util': {
-                    '$multiply': [
-                        {'$divide': [
-                            {'$subtract': [
-                                '$flight.Business Total Seats', 
-                                '$Business Available Seats'
-                            ]}, 
-                            '$flight.Business Total Seats'
-                        ]},
-                        100
-                    ]
+                    '$cond': {
+                        'if': {'$eq': ['$flight.Business Total Seats', 0]},
+                        'then': 0,
+                        'else': {
+                            '$multiply': [
+                                {'$divide': [
+                                    {'$subtract': [
+                                        '$flight.Business Total Seats',
+                                        '$Business Available Seats'
+                                    ]},
+                                    '$flight.Business Total Seats'
+                                ]},
+                                100
+                            ]
+                        }
+                    }
                 },
                 'economy_util': {
-                    '$multiply': [
-                        {'$divide': [
-                            {'$subtract': [
-                                '$flight.Economy Total Seats', 
-                                '$Economy Available Seats'
-                            ]}, 
-                            '$flight.Economy Total Seats'
-                        ]},
-                        100
-                    ]
+                    '$cond': {
+                        'if': {'$eq': ['$flight.Economy Total Seats', 0]},
+                        'then': 0,
+                        'else': {
+                            '$multiply': [
+                                {'$divide': [
+                                    {'$subtract': [
+                                        '$flight.Economy Total Seats',
+                                        '$Economy Available Seats'
+                                    ]},
+                                    '$flight.Economy Total Seats'
+                                ]},
+                                100
+                            ]
+                        }
+                    }
                 }
             }}
         ]))
+
         # Format the response
         response_data = {
             'total_bookings': total_bookings,
@@ -1265,7 +1278,7 @@ def statistics():
                 'revenue': f.get('revenue', 0)
             } for f in top_flights],
             'age_groups': [{
-                'age_range': f"{g.get('_id', 'Unknown')}",
+                'age_range': str(g.get('_id', 'Unknown')),
                 'count': g.get('count', 0)
             } for g in age_groups],
             'flight_utilization': [{
@@ -1274,12 +1287,13 @@ def statistics():
                 'economy_utilization': round(u.get('economy_util', 0), 2)
             } for u in utilization]
         }
-        
+
         return jsonify(response_data), 200
-        
+
     except Exception as e:
         app.logger.error(f'Error in statistics endpoint: {str(e)}')
         return jsonify({'msg': 'Error generating statistics', 'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     # Bind to 0.0.0.0 and use PORT from env for hosting providers (Render/Railway/etc.)
